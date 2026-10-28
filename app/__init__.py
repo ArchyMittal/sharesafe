@@ -1,0 +1,1 @@
+# ShareSafe app package

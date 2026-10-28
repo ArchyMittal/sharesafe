@@ -1,0 +1,26 @@
+[
+  {
+    "id": "u1",
+    "name": "Maya Lin",
+    "email": "maya.lin@univ.edu",
+    "role": "both",
+    "title": "Bioengineering '25",
+    "avatar": "https://lh3.googleusercontent.com/aida-public/AB6AXuBVKFNxHU8HR34pRc709VsMtWumElSaLspP4dFW3yQirc5MWOY6qSMSs5bZDMSw-q3aNu5DCxdGLqDJ4tcEWRvUNPysfYiQv4XhU5SuOxC53m54xTHkP7DD-eq2x-1rOYtg65_dOy-PoyDnu-kFmpk4kHNz8eh1tlDh-O_rlfzFvxYruv0oHSSrVhOl3zAWuWX1ubVYFuSRKDBaJuMMQKy2C2BtDHGsE4R0ug0UcOg"
+  },
+  {
+    "id": "u2",
+    "name": "Marcus Vance",
+    "email": "marcus.vance@univ.edu",
+    "role": "both",
+    "title": "Lab Custodian & Manager",
+    "avatar": null
+  },
+  {
+    "id": "u3",
+    "name": "Dr. Aris Thorne",
+    "email": "aris.thorne@univ.edu",
+    "role": "both",
+    "title": "Robotics Lab Director",
+    "avatar": null
+  }
+]
