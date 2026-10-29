@@ -12,3 +12,4 @@ def on_incident(incident_id: str, resource_id: str, context: Optional[dict] = No
     P1 stub: no-op until P4 lands.
     """
     return None
+

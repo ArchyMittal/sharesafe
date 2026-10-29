@@ -470,3 +470,4 @@ def _revert_resource_if_unoccupied(conn, resource_id: str, exclude_booking_id: O
         conn.execute("UPDATE resources SET status = ? WHERE id = ?", (res_stat, resource_id))
     else:
         conn.execute("UPDATE resources SET status = 'available' WHERE id = ?", (resource_id,))
+

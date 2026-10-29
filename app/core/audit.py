@@ -31,3 +31,4 @@ def append_audit(actor_id: str, action: str, payload: dict) -> str:
 
 def get_audit_trail() -> List[Dict[str, Any]]:
     return list(_in_memory_audit)
+

@@ -105,3 +105,4 @@ def test_api_full_journey_and_rbac(tmp_path, monkeypatch):
     # 11. Reset demo works
     res_reset = client.post("/api/admin/reset-demo")
     assert res_reset.status_code == 200
+

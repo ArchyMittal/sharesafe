@@ -19,3 +19,4 @@ def execute(actor: Actor, action: str, args: dict) -> dict:
     if action in _action_handlers:
         return _action_handlers[action](args)
     return {"action": action, "actor": actor.id, "args": args, "status": "executed"}
+
