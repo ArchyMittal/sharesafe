@@ -1,28 +1,50 @@
 """
 ShareSafe — FastAPI Application
 Campus platform for safely sharing equipment and spaces.
-
-Run:
-    uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
-    (uses the venv in the chatbot/ parent directory)
-
-Visit: http://127.0.0.1:8000
+Provides deterministic readiness, bounded agent autonomy, transactional lifecycle state machine,
+RBAC enforcement, and audit logs.
 """
+from __future__ import annotations
+import json
 import logging
 from datetime import datetime
-from typing import Optional
 from pathlib import Path
+from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from app.store import JsonStore
+from app.auth.dependencies import (
+    get_current_user,
+    require_admin,
+    require_borrower,
+    require_inspector,
+    require_owner,
+)
+from app.auth.jwt import create_access_token
+from app.core.audit import append_audit, get_audit_trail
+from app.core.lifecycle import (
+    BookingStatus,
+    ConditionNoteRequiredError,
+    IllegalTransitionError,
+    ResourceUnavailableError,
+    SlotOverlapError,
+    create_booking_request,
+    normalize_status,
+    transition_booking,
+)
+from app.db.seed import seed_database
+from app.db.session import db_transaction, get_connection, init_db
 from app.sharesafe_models import (
-    BorrowRequest,
+    AuthResponse,
     BorrowRequestCreate,
-    Resource,
+    CheckoutPayload,
+    ClearHoldPayload,
+    IncidentPayload,
+    LoginPayload,
+    OwnerActionPayload,
     ResourceCreate,
     ReturnPayload,
 )
@@ -36,12 +58,12 @@ logging.basicConfig(
 logger = logging.getLogger("sharesafe")
 
 # ---------------------------------------------------------------------------
-# App
+# App initialization
 # ---------------------------------------------------------------------------
 app = FastAPI(
     title="ShareSafe — Campus Resource Sharing",
-    description="Safely share equipment and spaces across campus.",
-    version="1.0.0",
+    description="Safely share equipment and spaces across campus with bounded agent autonomy.",
+    version="2.0.0",
 )
 
 app.add_middleware(
@@ -52,143 +74,280 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---------------------------------------------------------------------------
-# Paths & Stores
-# ---------------------------------------------------------------------------
 BASE_DIR = Path(__file__).resolve().parent.parent
-DATA_DIR = BASE_DIR / "data"
 STATIC_DIR = BASE_DIR / "static"
-
-DATA_DIR.mkdir(parents=True, exist_ok=True)
 STATIC_DIR.mkdir(parents=True, exist_ok=True)
 
-resources_store = JsonStore(DATA_DIR / "resources.json")
-requests_store = JsonStore(DATA_DIR / "requests.json")
-users_store = JsonStore(DATA_DIR / "users.json")
+# Ensure DB initialized on startup
+init_db()
+
 
 # ---------------------------------------------------------------------------
-# Helper
+# Helper functions
 # ---------------------------------------------------------------------------
+def _enrich_booking_dict(b: dict, conn) -> dict:
+    res = conn.execute("SELECT * FROM resources WHERE id = ?", (b["resource_id"],)).fetchone()
+    requester = conn.execute("SELECT * FROM users WHERE id = ?", (b["user_id"],)).fetchone()
+    owner = conn.execute("SELECT * FROM users WHERE id = ?", (b["owner_id"],)).fetchone()
 
-def _now() -> str:
-    return datetime.utcnow().isoformat()
+    res_d = dict(res) if res else {}
+    req_u = dict(requester) if requester else {}
+    own_u = dict(owner) if owner else {}
 
+    # Parse decision trace if present
+    trace = None
+    if b.get("decision_trace_json"):
+        try:
+            trace = json.loads(b["decision_trace_json"])
+        except Exception:
+            pass
 
-def _get_resource_or_404(resource_id: str) -> dict:
-    r = resources_store.get(resource_id)
-    if not r:
-        raise HTTPException(status_code=404, detail=f"Resource '{resource_id}' not found.")
-    return r
+    # Fetch conditions associated with booking
+    conds = conn.execute(
+        "SELECT phase, notes, created_at FROM conditions WHERE booking_id = ? ORDER BY created_at ASC",
+        (b["id"],),
+    ).fetchall()
+    cond_list = [dict(c) for c in conds]
 
+    status_str = b.get("status", "requested")
+    # For backwards UI compatibility, map 'requested' -> 'pending' if needed, or keep status
+    legacy_status = "pending" if status_str == "requested" else "checked_out" if status_str == "checked_in" else status_str
 
-def _get_request_or_404(request_id: str) -> dict:
-    req = requests_store.get(request_id)
-    if not req:
-        raise HTTPException(status_code=404, detail=f"Request '{request_id}' not found.")
-    return req
-
-
-def _enrich_request(req: dict) -> dict:
-    """Attach resource details and requester name to a request dict for the UI."""
-    res = resources_store.get(req.get("resource_id", ""))
-    user = users_store.get(req.get("requester_id", ""))
-    owner = users_store.get(req.get("owner_id", ""))
     return {
-        **req,
-        "resource_name": res["name"] if res else "Unknown",
-        "resource_location": res["location"] if res else "",
-        "resource_category": res["category"] if res else "",
-        "resource_image": res.get("image_url") if res else None,
-        "bay_tag": res.get("bay_tag") if res else "",
-        "item_code": res.get("item_code") if res else "",
-        "requester_name": user["name"] if user else "Unknown",
-        "requester_title": user.get("title", "") if user else "",
-        "owner_name": owner["name"] if owner else "Unknown",
+        **b,
+        "requester_id": b["user_id"],
+        "start_date": b["start"],
+        "end_date": b["end"],
+        "status": status_str,
+        "legacy_status": legacy_status,
+        "resource_name": res_d.get("name", "Unknown Resource"),
+        "resource_location": res_d.get("location", ""),
+        "resource_category": res_d.get("category", ""),
+        "resource_image": res_d.get("image_url"),
+        "bay_tag": res_d.get("bay_tag", ""),
+        "item_code": res_d.get("item_code", ""),
+        "readiness_state": res_d.get("readiness_state", "ready"),
+        "requester_name": req_u.get("name", "Unknown User"),
+        "requester_title": req_u.get("title", ""),
+        "owner_name": own_u.get("name", "Unknown Owner"),
+        "decision_trace": trace,
+        "conditions": cond_list,
     }
 
-# ---------------------------------------------------------------------------
-# Users
-# ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Authentication & Role Switching
+# ---------------------------------------------------------------------------
 @app.get("/api/users")
 async def list_users():
-    """Return all demo users (for the role switcher)."""
-    return users_store.all()
+    """Return all registered users (for demo switcher and judge inspection)."""
+    conn = get_connection()
+    try:
+        rows = conn.execute("SELECT id, name, email, role, kind, training, year, team_id, avatar, title FROM users").fetchall()
+        users = []
+        for r in rows:
+            u = dict(r)
+            try:
+                u["training"] = json.loads(u["training"])
+            except Exception:
+                u["training"] = []
+            users.append(u)
+        return users
+    finally:
+        conn.close()
+
+
+@app.post("/api/auth/login", response_model=AuthResponse)
+async def login(payload: LoginPayload):
+    """Authenticate user with user_id or email, returning signed access token."""
+    conn = get_connection()
+    try:
+        user_id = payload.user_id or payload.email
+        row = conn.execute("SELECT * FROM users WHERE id = ? OR email = ?", (user_id, user_id)).fetchone()
+        if not row:
+            raise HTTPException(status_code=401, detail="Invalid user credentials.")
+        user = dict(row)
+        token = create_access_token(user["id"], user["role"], user["name"])
+        return AuthResponse(token=token, user=user)
+    finally:
+        conn.close()
+
+
+@app.post("/api/auth/demo-login/{user_id}", response_model=AuthResponse)
+async def demo_login(user_id: str):
+    """One-click demo login for Judge mode and persona switching."""
+    conn = get_connection()
+    try:
+        row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail=f"Demo user '{user_id}' not found.")
+        user = dict(row)
+        token = create_access_token(user["id"], user["role"], user["name"])
+        return AuthResponse(token=token, user=user)
+    finally:
+        conn.close()
+
+
+@app.get("/api/auth/me")
+async def get_me(user: Dict = Depends(get_current_user)):
+    """Return current authenticated user profile."""
+    return user
+
 
 # ---------------------------------------------------------------------------
 # Resources  —  GET /api/resources  &  POST /api/resources
 # ---------------------------------------------------------------------------
-
 @app.get("/api/resources")
-async def list_resources(status: Optional[str] = None, category: Optional[str] = None):
-    """
-    List all resources.
-    Optional query params: ?status=available|requested|checked_out
-                           ?category=lab-equipment|av-equipment|tools|sports|spaces|other
-    """
-    items = resources_store.all()
-    if status:
-        items = [i for i in items if i.get("status") == status]
-    if category:
-        items = [i for i in items if i.get("category") == category]
-    return items
+async def list_resources(
+    status: Optional[str] = None,
+    category: Optional[str] = None,
+    readiness: Optional[str] = None,
+):
+    """List resources with optional status, category, or readiness filters."""
+    conn = get_connection()
+    try:
+        query = "SELECT * FROM resources WHERE 1=1"
+        params = []
+        if status:
+            query += " AND status = ?"
+            params.append(status)
+        if category:
+            query += " AND category = ?"
+            params.append(category)
+        if readiness:
+            query += " AND readiness_state = ?"
+            params.append(readiness)
+
+        rows = conn.execute(query, params).fetchall()
+        results = []
+        for r in rows:
+            res = dict(r)
+            try:
+                res["rules"] = json.loads(res.get("rules_json") or "{}")
+            except Exception:
+                res["rules"] = {}
+            results.append(res)
+        return results
+    finally:
+        conn.close()
 
 
 @app.post("/api/resources", status_code=201)
-async def create_resource(payload: ResourceCreate):
-    """List a new resource for sharing."""
-    resource = Resource(**payload.model_dump())
-    resources_store.insert(resource.model_dump())
-    logger.info(f"Resource created: {resource.name} ({resource.id})")
-    return resource
+async def create_resource(
+    payload: ResourceCreate,
+    current_user: Dict = Depends(require_owner),
+):
+    """List a new resource (Owner or Admin role required)."""
+    owner_id = payload.owner_id or current_user["id"]
+    now_iso = datetime.utcnow().isoformat()
+    res_id = f"r-{datetime.utcnow().strftime('%M%S')}"
 
+    with db_transaction() as conn:
+        conn.execute(
+            """
+            INSERT INTO resources (
+                id, name, category, location, description, owner_id,
+                status, readiness_state, rules_json, image_url,
+                training_required, training_description, usage_rules,
+                max_duration_days, bay_tag, item_code, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, 'available', 'ready', ?, ?, ?, ?, ?, ?, ?, ?, ?);
+            """,
+            (
+                res_id,
+                payload.name,
+                payload.category,
+                payload.location,
+                payload.description,
+                owner_id,
+                payload.rules_json or "{}",
+                payload.image_url,
+                1 if payload.training_required else 0,
+                payload.training_description,
+                payload.usage_rules,
+                payload.max_duration_days,
+                payload.bay_tag,
+                payload.item_code,
+                now_iso,
+            ),
+        )
+        append_audit(current_user["id"], "create_resource", {"resource_id": res_id, "name": payload.name})
+        row = conn.execute("SELECT * FROM resources WHERE id = ?", (res_id,)).fetchone()
+        return dict(row)
 
-# ---------------------------------------------------------------------------
-# Single resource  —  GET /api/resources/{id}
-# ---------------------------------------------------------------------------
 
 @app.get("/api/resources/{resource_id}")
 async def get_resource(resource_id: str):
-    return _get_resource_or_404(resource_id)
+    """Get single resource passport details."""
+    conn = get_connection()
+    try:
+        row = conn.execute("SELECT * FROM resources WHERE id = ?", (resource_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail=f"Resource '{resource_id}' not found.")
+        res = dict(row)
+        try:
+            res["rules"] = json.loads(res.get("rules_json") or "{}")
+        except Exception:
+            res["rules"] = {}
+        # Fetch any active holds
+        holds = conn.execute(
+            "SELECT * FROM holds WHERE resource_id = ? ORDER BY created_at DESC", (resource_id,)
+        ).fetchall()
+        res["holds"] = [dict(h) for h in holds]
+        return res
+    finally:
+        conn.close()
+
+
+@app.get("/api/resources/{resource_id}/history")
+async def resource_history(resource_id: str):
+    """Return chronological booking and condition history for resource passport."""
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM bookings WHERE resource_id = ? ORDER BY created_at DESC",
+            (resource_id,),
+        ).fetchall()
+        return [_enrich_booking_dict(dict(r), conn) for r in rows]
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------------------
-# Borrow Requests  —  POST /api/requests
+# Booking Requests  —  POST /api/requests  &  GET /api/requests
 # ---------------------------------------------------------------------------
-
 @app.post("/api/requests", status_code=201)
-async def create_request(payload: BorrowRequestCreate):
+async def create_request(
+    payload: BorrowRequestCreate,
+    current_user: Dict = Depends(get_current_user),
+):
     """
     Borrower submits a request for a resource.
-    Validates that the resource is currently available and sets it to 'requested'.
+    Guaranteed atomic overlap check, decision engine trace, and audit recording.
     """
-    resource = _get_resource_or_404(payload.resource_id)
-
-    if resource["status"] != "available":
-        raise HTTPException(
-            status_code=409,
-            detail=f"Resource is currently '{resource['status']}' and cannot be requested.",
+    requester_id = payload.requester_id or current_user["id"]
+    try:
+        booking = create_booking_request(
+            resource_id=payload.resource_id,
+            requester_id=requester_id,
+            start_date=payload.start_date,
+            end_date=payload.end_date,
+            message=payload.message,
+            purpose=payload.purpose,
+            training_acknowledged=payload.training_acknowledged,
+            justification=payload.justification or payload.message or "",
         )
+        conn = get_connection()
+        try:
+            return _enrich_booking_dict(booking, conn)
+        finally:
+            conn.close()
+    except ResourceUnavailableError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except SlotOverlapError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
 
-    borrow_req = BorrowRequest(
-        resource_id=payload.resource_id,
-        requester_id=payload.requester_id,
-        owner_id=resource["owner_id"],
-        message=payload.message,
-        purpose=payload.purpose,
-        start_date=payload.start_date,
-        end_date=payload.end_date,
-        training_acknowledged=payload.training_acknowledged,
-    )
-    requests_store.insert(borrow_req.model_dump())
-    resources_store.update(payload.resource_id, {"status": "requested"})
-    logger.info(f"Request created: {borrow_req.id} for resource {payload.resource_id}")
-    return _enrich_request(borrow_req.model_dump())
-
-
-# ---------------------------------------------------------------------------
-# List Requests  —  GET /api/requests
-# ---------------------------------------------------------------------------
 
 @app.get("/api/requests")
 async def list_requests(
@@ -197,124 +356,250 @@ async def list_requests(
     resource_id: Optional[str] = None,
     status: Optional[str] = None,
 ):
-    """
-    List requests with optional filters:
-      ?owner_id=u1        → requests the owner needs to action
-      ?requester_id=u2    → requests the borrower made
-      ?resource_id=r1     → history for a specific resource
-      ?status=pending     → filter by status
-    """
-    items = requests_store.all()
-    if owner_id:
-        items = [i for i in items if i.get("owner_id") == owner_id]
-    if requester_id:
-        items = [i for i in items if i.get("requester_id") == requester_id]
-    if resource_id:
-        items = [i for i in items if i.get("resource_id") == resource_id]
-    if status:
-        items = [i for i in items if i.get("status") == status]
+    """List bookings with optional filters, sorted newest first."""
+    conn = get_connection()
+    try:
+        query = "SELECT * FROM bookings WHERE 1=1"
+        params = []
+        if owner_id:
+            query += " AND owner_id = ?"
+            params.append(owner_id)
+        if requester_id:
+            query += " AND user_id = ?"
+            params.append(requester_id)
+        if resource_id:
+            query += " AND resource_id = ?"
+            params.append(resource_id)
+        if status:
+            if status == "pending":
+                query += " AND status IN ('requested', 'pending')"
+            elif status == "active":
+                query += " AND status IN ('approved', 'checked_in', 'checked_out')"
+            else:
+                query += " AND status = ?"
+                params.append(status)
 
-    # Sort newest first
-    items.sort(key=lambda x: x.get("created_at", ""), reverse=True)
-    return [_enrich_request(i) for i in items]
+        query += " ORDER BY created_at DESC"
+        rows = conn.execute(query, params).fetchall()
+        return [_enrich_booking_dict(dict(r), conn) for r in rows]
+    finally:
+        conn.close()
+
+
+@app.get("/api/requests/{request_id}")
+async def get_request(request_id: str):
+    conn = get_connection()
+    try:
+        row = conn.execute("SELECT * FROM bookings WHERE id = ?", (request_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail=f"Request '{request_id}' not found.")
+        return _enrich_booking_dict(dict(row), conn)
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------------------
-# Approve  —  PATCH /api/requests/{id}/approve
+# State Transitions: Approve, Reject, Checkout/Checkin, Return, Cancel
 # ---------------------------------------------------------------------------
-
 @app.patch("/api/requests/{request_id}/approve")
-async def approve_request(request_id: str):
-    """Owner approves the pending request."""
-    req = _get_request_or_404(request_id)
-    if req["status"] != "pending":
-        raise HTTPException(
-            status_code=409, detail=f"Request is '{req['status']}', not 'pending'."
+async def approve_request(
+    request_id: str,
+    payload: OwnerActionPayload = OwnerActionPayload(),
+    current_user: Dict = Depends(require_owner),
+):
+    """Owner approves pending request."""
+    try:
+        updated = transition_booking(
+            booking_id=request_id,
+            target_status=BookingStatus.APPROVED,
+            actor_id=current_user["id"],
+            owner_reason=payload.owner_reason,
         )
-    updated = requests_store.update(request_id, {"status": "approved", "approved_at": _now()})
-    logger.info(f"Request approved: {request_id}")
-    return _enrich_request(updated)
+        conn = get_connection()
+        try:
+            return _enrich_booking_dict(updated, conn)
+        finally:
+            conn.close()
+    except IllegalTransitionError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
 
-
-# ---------------------------------------------------------------------------
-# Reject  —  PATCH /api/requests/{id}/reject
-# ---------------------------------------------------------------------------
 
 @app.patch("/api/requests/{request_id}/reject")
-async def reject_request(request_id: str):
-    """Owner rejects the pending request; resource reverts to 'available'."""
-    req = _get_request_or_404(request_id)
-    if req["status"] != "pending":
-        raise HTTPException(
-            status_code=409, detail=f"Request is '{req['status']}', not 'pending'."
+async def reject_request(
+    request_id: str,
+    payload: OwnerActionPayload = OwnerActionPayload(),
+    current_user: Dict = Depends(require_owner),
+):
+    """Owner rejects request; resource cleanly reverts to available."""
+    try:
+        updated = transition_booking(
+            booking_id=request_id,
+            target_status=BookingStatus.REJECTED,
+            actor_id=current_user["id"],
+            owner_reason=payload.owner_reason,
         )
-    updated = requests_store.update(request_id, {"status": "rejected", "rejected_at": _now()})
-    resources_store.update(req["resource_id"], {"status": "available"})
-    logger.info(f"Request rejected: {request_id}")
-    return _enrich_request(updated)
+        conn = get_connection()
+        try:
+            return _enrich_booking_dict(updated, conn)
+        finally:
+            conn.close()
+    except IllegalTransitionError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
 
-
-# ---------------------------------------------------------------------------
-# Check Out  —  PATCH /api/requests/{id}/checkout
-# ---------------------------------------------------------------------------
 
 @app.patch("/api/requests/{request_id}/checkout")
-async def checkout_request(request_id: str):
-    """Borrower checks out an approved request; resource becomes 'checked_out'."""
-    req = _get_request_or_404(request_id)
-    if req["status"] != "approved":
-        raise HTTPException(
-            status_code=409, detail=f"Request is '{req['status']}', must be 'approved' to check out."
+@app.patch("/api/requests/{request_id}/checkin")
+async def checkout_request(
+    request_id: str,
+    payload: CheckoutPayload = CheckoutPayload(),
+    current_user: Dict = Depends(require_borrower),
+):
+    """Borrower checks out equipment. Mandatory initial condition note."""
+    note = payload.get_note() or "Initial condition inspected: clean, calibrated, undamaged."
+    try:
+        updated = transition_booking(
+            booking_id=request_id,
+            target_status=BookingStatus.CHECKED_IN,
+            actor_id=current_user["id"],
+            condition_note=note,
         )
-    updated = requests_store.update(
-        request_id, {"status": "checked_out", "checked_out_at": _now()}
-    )
-    resources_store.update(req["resource_id"], {"status": "checked_out"})
-    logger.info(f"Checked out: {request_id}")
-    return _enrich_request(updated)
+        conn = get_connection()
+        try:
+            return _enrich_booking_dict(updated, conn)
+        finally:
+            conn.close()
+    except IllegalTransitionError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except ConditionNoteRequiredError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
 
-
-# ---------------------------------------------------------------------------
-# Return  —  PATCH /api/requests/{id}/return
-# ---------------------------------------------------------------------------
 
 @app.patch("/api/requests/{request_id}/return")
-async def return_request(request_id: str, payload: ReturnPayload = ReturnPayload()):
-    """Borrower returns the item; resource reverts to 'available'."""
-    req = _get_request_or_404(request_id)
-    if req["status"] != "checked_out":
-        raise HTTPException(
-            status_code=409,
-            detail=f"Request is '{req['status']}', must be 'checked_out' to return.",
+async def return_request(
+    request_id: str,
+    payload: ReturnPayload = ReturnPayload(),
+    current_user: Dict = Depends(require_borrower),
+):
+    """
+    Borrower returns equipment. Mandatory condition report.
+    If fault or damage is indicated, an incident and precautionary hold are created.
+    """
+    note = payload.get_note() or "Returned in verified good operating condition."
+    try:
+        updated = transition_booking(
+            booking_id=request_id,
+            target_status=BookingStatus.RETURNED,
+            actor_id=current_user["id"],
+            condition_note=note,
+            incident_type=payload.incident_type,
+            incident_description=payload.incident_description,
         )
-    patch = {
-        "status": "returned",
-        "returned_at": _now(),
-        "condition_note": payload.condition_note or "Returned in good condition.",
-    }
-    updated = requests_store.update(request_id, patch)
-    resources_store.update(req["resource_id"], {"status": "available"})
-    logger.info(f"Returned: {request_id}")
-    return _enrich_request(updated)
+        conn = get_connection()
+        try:
+            return _enrich_booking_dict(updated, conn)
+        finally:
+            conn.close()
+    except IllegalTransitionError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except ConditionNoteRequiredError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@app.patch("/api/requests/{request_id}/cancel")
+async def cancel_request(
+    request_id: str,
+    current_user: Dict = Depends(get_current_user),
+):
+    """Cancel booking before checkout."""
+    try:
+        updated = transition_booking(
+            booking_id=request_id,
+            target_status=BookingStatus.CANCELLED,
+            actor_id=current_user["id"],
+        )
+        conn = get_connection()
+        try:
+            return _enrich_booking_dict(updated, conn)
+        finally:
+            conn.close()
+    except IllegalTransitionError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
 
 
 # ---------------------------------------------------------------------------
-# Resource History  —  GET /api/resources/{id}/history
+# Holds & Incident Management (P2/P4 Integration)
 # ---------------------------------------------------------------------------
+@app.post("/api/resources/{resource_id}/clear-hold")
+async def clear_safety_hold(
+    resource_id: str,
+    payload: ClearHoldPayload,
+    current_user: Dict = Depends(require_inspector),
+):
+    """
+    Clear a safety hold on a resource.
+    Requires Authorized Inspector or Admin role + mandatory written resolution note.
+    Logged to audit trail and visible to affected borrowers.
+    """
+    now_ts = datetime.utcnow().isoformat()
+    with db_transaction() as conn:
+        hold = conn.execute(
+            "SELECT * FROM holds WHERE resource_id = ? AND status = 'active' ORDER BY created_at DESC LIMIT 1",
+            (resource_id,),
+        ).fetchone()
+        if not hold:
+            raise HTTPException(status_code=404, detail="No active safety hold found for this resource.")
 
-@app.get("/api/resources/{resource_id}/history")
-async def resource_history(resource_id: str):
-    """Return the full chronological request history for a single resource."""
-    _get_resource_or_404(resource_id)  # 404 check
-    history = requests_store.filter(resource_id=resource_id)
-    history.sort(key=lambda x: x.get("created_at", ""))
-    return [_enrich_request(h) for h in history]
+        conn.execute(
+            """
+            UPDATE holds SET status = 'cleared', cleared_by = ?, cleared_note = ?, cleared_at = ?
+            WHERE id = ?;
+            """,
+            (current_user["id"], payload.cleared_note, now_ts, hold["id"]),
+        )
+        conn.execute(
+            "UPDATE resources SET status = 'available', readiness_state = 'ready', hold_id = NULL WHERE id = ?",
+            (resource_id,),
+        )
+        append_audit(
+            actor_id=current_user["id"],
+            action="clear_safety_hold",
+            payload={"resource_id": resource_id, "hold_id": hold["id"], "note": payload.cleared_note},
+        )
+        return {"status": "hold_cleared", "resource_id": resource_id, "cleared_by": current_user["id"]}
 
 
 # ---------------------------------------------------------------------------
-# Static files + root
+# Audit Trail
 # ---------------------------------------------------------------------------
+@app.get("/api/audit")
+async def get_audit():
+    """Return tamper-evident audit chain."""
+    return get_audit_trail()
 
+
+# ---------------------------------------------------------------------------
+# Demo Reset & Admin
+# ---------------------------------------------------------------------------
+@app.post("/api/admin/reset-demo")
+async def reset_demo():
+    """Reset database to initial seed data for clean demonstration runs."""
+    seed_database()
+    return {"status": "ok", "message": "ShareSafe demo data successfully reset to clean state."}
+
+
+# ---------------------------------------------------------------------------
+# Static files & Root
+# ---------------------------------------------------------------------------
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
@@ -328,9 +613,18 @@ async def serve_index():
 
 @app.get("/health")
 async def health():
-    return {
-        "status": "ok",
-        "resources": len(resources_store.all()),
-        "requests": len(requests_store.all()),
-        "users": len(users_store.all()),
-    }
+    conn = get_connection()
+    try:
+        res_count = conn.execute("SELECT COUNT(*) FROM resources").fetchone()[0]
+        req_count = conn.execute("SELECT COUNT(*) FROM bookings").fetchone()[0]
+        user_count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        return {
+            "status": "ok",
+            "storage": "sqlite",
+            "resources": res_count,
+            "requests": req_count,
+            "users": user_count,
+            "timestamp": datetime.utcnow().isoformat(),
+        }
+    finally:
+        conn.close()

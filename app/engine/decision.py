@@ -79,7 +79,7 @@ def _build_plain_language_explanation(
 def evaluate_request(
     request: RequestCtx,
     resource: ResourceCtx,
-    user: UserCtx,
+    user: Optional[UserCtx] = None,
     history: Optional[List[BookingCtx]] = None,
     competing: Optional[List[RequestCtx]] = None,
     now: Optional[datetime] = None,
@@ -94,6 +94,7 @@ def evaluate_request(
         now = request.created_at
 
     history = history or []
+    user = user or request.user
     competing = competing or []
     rules = resource.rules or {}
 

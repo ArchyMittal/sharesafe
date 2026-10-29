@@ -53,3 +53,4 @@ def test_api_fairness_summary():
     assert "weights_config" in data
     assert "simulation_metrics" in data
     assert data["simulation_metrics"]["gini_engine"] == 0.4676
+

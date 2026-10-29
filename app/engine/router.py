@@ -117,3 +117,4 @@ async def get_fairness_summary():
         },
         "report_markdown": report_content,
     }
+

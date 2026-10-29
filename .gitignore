@@ -8,3 +8,9 @@ venv/
 ENV/
 .DS_Store
 *.log
+*.db
+*.db-shm
+*.db-wal
+data/*.db
+data/*.db-shm
+data/*.db-wal

@@ -24,3 +24,4 @@ def test_different_photos_triggers_human_review():
     assert len(result["changed_regions"]) > 0
     assert "human review needed" in result["note"].lower()
     assert result["before_sha256"] != result["after_sha256"]
+

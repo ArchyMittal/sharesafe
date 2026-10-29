@@ -13,9 +13,7 @@ class Verdict(str, Enum):
     NEEDS_HUMAN = "needs_human"
 
 class Severity(str, Enum):
-    BLOCK = "block"
-    CONDITION = "condition"
-    INFO = "info"
+    BLOCK = "block"; CONDITION = "condition"; INFO = "info"
 
 @dataclass
 class RuleResult:
@@ -40,54 +38,32 @@ class Decision:
 
 @dataclass
 class UserCtx:
-    id: str
-    role: str
-    year: int
-    training: list[str]
-    team_id: Optional[str] = None
+    id: str; role: str; year: int; training: list[str]; team_id: Optional[str] = None
 
 @dataclass
 class ResourceCtx:
-    id: str
-    category: str
-    rules: dict
-    readiness: str   # "ready" | "ready_with_conditions" | "not_ready"
+    id: str; category: str; rules: dict; readiness: str   # "ready" | "ready_with_conditions" | "not_ready"
 
 @dataclass
 class BookingCtx:
-    id: str
-    resource_id: str
-    user_id: str
-    team_id: Optional[str]
-    start: datetime
-    end: datetime
-    status: str
-    created_at: datetime
-    returned_late: bool = False
-    no_show: bool = False
+    id: str; resource_id: str; user_id: str; team_id: Optional[str]
+    start: datetime; end: datetime; status: str; created_at: datetime
+    returned_late: bool = False; no_show: bool = False
 
 @dataclass
 class RequestCtx:
-    user: UserCtx
-    resource_id: str
-    start: datetime
-    end: datetime
-    created_at: datetime
+    user: UserCtx; resource_id: str; start: datetime; end: datetime; created_at: datetime
     deadline: Optional[datetime] = None
     justification: str = ""           # UNTRUSTED free text. Engine must NEVER read it.
 
 @dataclass
 class Flag:
     kind: str                         # "proxy_booking" | "hoarding" | ...
-    user_ids: list[str]
-    booking_ids: list[str]
-    reason: str
+    user_ids: list[str]; booking_ids: list[str]; reason: str
 
 # ---------- readiness (app/core/readiness.py, P2) ----------
 class Readiness(str, Enum):
-    READY = "ready"
-    CONDITIONS = "ready_with_conditions"
-    NOT_READY = "not_ready"
+    READY = "ready"; CONDITIONS = "ready_with_conditions"; NOT_READY = "not_ready"
 
 @dataclass
 class ReadinessResult:
@@ -97,24 +73,23 @@ class ReadinessResult:
 # ---------- authority gate (app/core/authority.py, P2) ----------
 @dataclass
 class Actor:
-    id: str
-    kind: str                         # "human" | "agent"
-    role: str
+    id: str; kind: str; role: str     # kind: "human" | "agent"
+
+# execute(actor: Actor, action: str, args: dict) -> dict
+#   raises PermissionError if an agent attempts a human-only action; the denial is written to the audit chain.
+# append_audit(actor_id: str, action: str, payload: dict) -> str   # returns hash   (app/core/audit.py, P2)
 
 # ---------- evidence packet (app/agent, P4) ----------
 @dataclass
 class EvidencePacket:
-    incident_id: str
-    resource_id: str
-    summary: str
-    timeline: list[dict]
-    affected_bookings: list[str]
-    similar_incidents: list[str]
+    incident_id: str; resource_id: str; summary: str
+    timeline: list[dict]; affected_bookings: list[str]; similar_incidents: list[str]
     suggested_next_step: str
     generated_by: str                 # "template" | "llm"
 
 # ---------- policy compiler (app/agent/policy.py, P4) ----------
 @dataclass
 class CompiledPolicy:
-    rules: dict                       # must validate against RESOURCE_RULES_SCHEMA
+    rules: dict                       # must validate against RESOURCE_RULES_SCHEMA below
     warnings: list[str] = field(default_factory=list)
+

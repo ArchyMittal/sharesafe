@@ -104,3 +104,4 @@ def compare_photos(
         "requires_human_review": requires_review,
         "note": note,
     }
+
