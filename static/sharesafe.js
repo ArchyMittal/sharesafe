@@ -34,7 +34,16 @@ const state = {
 const API = '/api';
 
 async function apiFetch(path, options = {}) {
-  const res = await fetch(API + path, options);
+  const headers = { ...(options.headers || {}) };
+  if (state.activeUserId) {
+    headers['X-User-Id'] = state.activeUserId;
+  }
+  const token = localStorage.getItem(`ss_token_${state.activeUserId}`);
+  if (token && !headers['Authorization']) {
+    headers['Authorization'] = `Bearer ${token}`;
+  }
+
+  const res = await fetch(API + path, { ...options, headers });
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: res.statusText }));
     throw new Error(err.detail || 'API error');
@@ -45,6 +54,37 @@ async function apiFetch(path, options = {}) {
 const get = (path) => apiFetch(path);
 const post = (path, body) => apiFetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
 const patch = (path, body = {}) => apiFetch(path, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+
+// Judge Mode & Admin Helpers
+window.setDemoUser = async function(userId) {
+  state.activeUserId = userId;
+  localStorage.setItem('ss_active_user', userId);
+  try {
+    const auth = await post(`/auth/demo-login/${userId}`, {});
+    if (auth && auth.token) {
+      localStorage.setItem(`ss_token_${userId}`, auth.token);
+    }
+  } catch (e) {
+    console.warn('Demo login token fallback:', e);
+  }
+  const select = document.getElementById('userSelectDropdown');
+  if (select) select.value = userId;
+  updateUserProfileDisplay();
+  await refreshData();
+  const u = getActiveUser();
+  showToast(`Switched persona to: ${u ? u.name : userId} (${u ? u.role : ''})`, 'info');
+};
+
+window.resetDemo = async function() {
+  if (!confirm('Reset all demo resources, bookings, and audit records to seed state?')) return;
+  try {
+    await post('/admin/reset-demo', {});
+    showToast('Demo state successfully reset to clean seed!', 'success');
+    await refreshData();
+  } catch (e) {
+    showToast('Reset failed: ' + e.message, 'error');
+  }
+};
 
 // ============================================================
 // Toast Notifications
@@ -609,8 +649,8 @@ function renderRequests() {
 
   if (!container) return;
 
-  const pending = state.requests.filter(r => r.status === 'pending');
-  const active = state.requests.filter(r => r.status === 'approved' || r.status === 'checked_out');
+  const pending = state.requests.filter(r => r.status === 'pending' || r.status === 'requested');
+  const active = state.requests.filter(r => r.status === 'approved' || r.status === 'checked_out' || r.status === 'checked_in');
 
   if (badgePending) badgePending.textContent = pending.length;
   if (badgeActive) badgeActive.textContent = active.length;
@@ -654,9 +694,9 @@ function renderRequests() {
 }
 
 function renderRequestCard(req) {
-  const isPending = req.status === 'pending';
+  const isPending = req.status === 'pending' || req.status === 'requested';
   const isApproved = req.status === 'approved';
-  const isCheckedOut = req.status === 'checked_out';
+  const isCheckedOut = req.status === 'checked_out' || req.status === 'checked_in';
   const isReturned = req.status === 'returned';
 
   const defaultImg = 'https://lh3.googleusercontent.com/aida-public/AB6AXuAmxXq8J2i-qcGn3Sfi6PeE40BZ0lNAUEzBduCuuegSwW-O5EZqiB6udmX3Q2I-QYIshdM3VCYbA3UNRb3znwref2sRX9aa3cnmRFNEARnSytkupL85csltSChTVHMJtWW56d3pW09HWzWCVTeasjroHqTTA88WngfQr4_DTNeMeFBGMIuO-MXrF1TKwMTcAoXEQWG1UzVxJ8IpQ8i-auH-qyUSOHGVkoJL2Yd7gjg';
@@ -673,11 +713,33 @@ function renderRequestCard(req) {
     statusBadge = `<span class="px-2.5 py-1 rounded-full bg-slate-100 text-slate-700 border border-slate-300 text-xs font-semibold">${req.status.toUpperCase()}</span>`;
   }
 
+  let traceHtml = '';
+  if (req.decision_trace && req.decision_trace.rule_results) {
+    const rules = req.decision_trace.rule_results.map(r => `
+      <div class="flex items-center gap-1.5 text-[11px] ${r.passed ? 'text-emerald-700' : 'text-rose-700 font-semibold'}">
+        <span class="material-symbols-outlined text-[14px]">${r.passed ? 'check_circle' : 'cancel'}</span>
+        <span>${r.message}</span>
+      </div>
+    `).join('');
+    traceHtml = `
+      <div class="mt-2 p-2.5 rounded-xl bg-surface-container-low border border-outline-variant/30 text-xs space-y-1">
+        <div class="flex items-center justify-between text-[11px] font-bold text-on-surface">
+          <span>🧠 Explainable Decision Trace</span>
+          <span class="font-mono uppercase text-[10px] px-1.5 py-0.5 rounded ${req.decision_trace.verdict.includes('approve') ? 'bg-emerald-100 text-emerald-800' : 'bg-amber-100 text-amber-800'}">
+            ${req.decision_trace.verdict}
+          </span>
+        </div>
+        ${rules}
+        ${req.decision_trace.explanation ? `<p class="text-[11px] text-on-surface-variant italic pt-0.5">${req.decision_trace.explanation}</p>` : ''}
+      </div>
+    `;
+  }
+
   return `
     <div class="bg-surface-container-lowest rounded-2xl border border-outline-variant/30 p-5 shadow-xs flex flex-col md:flex-row items-start md:items-center justify-between gap-4">
       <div class="flex items-start gap-4 flex-1">
         <img alt="${req.resource_name}" class="w-20 h-20 rounded-xl object-cover bg-surface-container flex-shrink-0" src="${imgUrl}"/>
-        <div class="space-y-1">
+        <div class="space-y-1 flex-1">
           <div class="flex items-center gap-2">
             <h4 class="text-sm font-bold text-on-surface">${req.resource_name}</h4>
             ${statusBadge}
@@ -693,6 +755,7 @@ function renderRequestCard(req) {
             <span>•</span>
             <span class="font-mono">Req ID: #${req.id.slice(0, 8)}</span>
           </div>
+          ${traceHtml}
         </div>
       </div>
 
@@ -752,8 +815,8 @@ function renderKiosk() {
 
   // Filter approved requests for pickup
   const approved = state.requests.filter(r => r.status === 'approved');
-  // Filter checked_out requests for return
-  const checkedOut = state.requests.filter(r => r.status === 'checked_out');
+  // Filter checked_out/checked_in requests for return
+  const checkedOut = state.requests.filter(r => r.status === 'checked_out' || r.status === 'checked_in');
 
   if (approved.length === 0) {
     pickupList.innerHTML = `
@@ -808,7 +871,9 @@ function renderKiosk() {
 
 window.kioskCheckout = async function(requestId) {
   try {
-    await patch(`/requests/${requestId}/checkout`);
+    const conditionNote = prompt('Confirm checkout initial inspection condition:', 'Clean, undamaged, verified operational.');
+    if (conditionNote === null) return;
+    await patch(`/requests/${requestId}/checkout`, { condition_note: conditionNote });
     showToast('Locker door unlatched! Equipment dispatched into borrower custody.', 'success');
     await refreshData();
   } catch (err) {
@@ -818,11 +883,27 @@ window.kioskCheckout = async function(requestId) {
 
 window.kioskReturn = async function(requestId) {
   try {
-    const conditionNote = prompt('Confirm return inspection condition:', 'Returned in clean, calibrated operational condition.');
+    const conditionNote = prompt('Confirm return inspection condition (type "fan fault" to test incident hold):', 'Returned in clean, calibrated operational condition.');
     if (conditionNote === null) return;
 
-    await patch(`/requests/${requestId}/return`, { condition_note: conditionNote });
-    showToast('Equipment safely verified and locked into locker. Custodianship restored!', 'success');
+    let incidentType = null;
+    let incidentDescription = null;
+    const lower = conditionNote.toLowerCase();
+    if (lower.includes('fault') || lower.includes('damage') || lower.includes('broken') || lower.includes('fan')) {
+      incidentType = 'fault';
+      incidentDescription = conditionNote;
+    }
+
+    await patch(`/requests/${requestId}/return`, {
+      condition_note: conditionNote,
+      incident_type: incidentType,
+      incident_description: incidentDescription
+    });
+    if (incidentType) {
+      showToast('⚠️ Fault reported! Precautionary safety hold automatically placed by Custodian Agent.', 'warning');
+    } else {
+      showToast('Equipment safely verified and locked into locker. Custodianship restored!', 'success');
+    }
     await refreshData();
   } catch (err) {
     showToast('Return failed: ' + err.message, 'error');
