@@ -33,6 +33,17 @@ print(decision.explanation)   # Deterministic plain-language explanation
 
 ---
 
+## FastAPI Router for Lead (`app/engine/router.py`)
+Mounted via:
+```python
+from app.engine.router import router as engine_router
+app.include_router(engine_router)
+```
+- `POST /api/engine/evaluate`: Evaluates incoming booking requests.
+- `GET /api/engine/fairness/summary`: Returns simulation benchmark metrics and configurable weights for admin/judge dashboards.
+
+---
+
 ## Anti-Monopolisation & Proxy Detection
 
 ```python
@@ -42,6 +53,19 @@ from app.engine.fairness import detect_proxy_patterns
 flags = detect_proxy_patterns(all_bookings)
 for flag in flags:
     print(flag.kind, flag.user_ids, flag.reason)
+```
+
+---
+
+## Advisory Photo Comparison (Stretch: `app/vision/compare.py`)
+```python
+from app.vision.compare import compare_photos
+
+# Compares check-in and return photos advisory-only
+result = compare_photos(before_bytes, after_bytes, angle="front")
+print(result["score"])                  # Visual difference score (0.0 to 1.0)
+print(result["requires_human_review"])  # Advisory flag (True/False)
+print(result["note"])                   # Plain language advisory note
 ```
 
 ---
